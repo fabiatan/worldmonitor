@@ -19,6 +19,8 @@
  * and breaks Node test runners on import).
  */
 
+import { clearReferralOnAttribution } from './referral-capture';
+
 export const LAST_CHECKOUT_ATTEMPT_KEY = 'wm-last-checkout-attempt';
 
 export interface CheckoutAttempt {
@@ -76,11 +78,19 @@ export function loadCheckoutAttempt(): CheckoutAttempt | null {
   }
 }
 
-export function clearCheckoutAttempt(_reason: CheckoutAttemptClearReason): void {
+export function clearCheckoutAttempt(reason: CheckoutAttemptClearReason): void {
   try {
     sessionStorage.removeItem(LAST_CHECKOUT_ATTEMPT_KEY);
   } catch {
     // Ignore storage failures.
+  }
+  // Successful paid attribution is the ONE terminal that should also
+  // retire any stored referral code. Every other clear-reason
+  // (duplicate, signout, dismissed, abandoned) leaves the ref in
+  // place so the user can retry later without losing their share
+  // attribution. See referral-capture.ts for the storage lifecycle.
+  if (reason === 'success') {
+    clearReferralOnAttribution();
   }
 }
 

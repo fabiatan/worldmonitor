@@ -18,6 +18,7 @@ import { openBillingPortal } from './billing';
 import { getCurrentClerkUser, getClerkToken } from './clerk';
 import { subscribeAuthState } from './auth-state';
 import { saveCheckoutAttempt, clearCheckoutAttempt } from './checkout-attempt';
+import { loadActiveReferral } from './referral-capture';
 
 export {
   saveCheckoutAttempt,
@@ -338,12 +339,20 @@ export async function startCheckout(
 
   _checkoutInFlight = true;
   _successFired = false;
+  // Fall back to the stored referral when the caller doesn't pass one.
+  // A dashboard-origin upgrade click has no ref in hand — it arrives
+  // from a locked-panel CTA or the Manage Billing surface — but the
+  // visitor may have landed on /pro via `?ref=<code>` earlier in this
+  // session or within the 7-day TTL on another tab. loadActiveReferral
+  // returns null (and clears) on stale records, so this is safe to
+  // call unconditionally.
+  const effectiveReferral = options?.referralCode ?? loadActiveReferral() ?? undefined;
   // Record the attempt BEFORE the network call so the failure-retry
   // banner has context even if every subsequent step fails (timeout,
   // user closes tab before Dodo redirects, SDK crashes, etc.).
   saveCheckoutAttempt({
     productId,
-    referralCode: options?.referralCode,
+    referralCode: effectiveReferral,
     discountCode: options?.discountCode,
     startedAt: Date.now(),
     origin: 'dashboard',
@@ -366,7 +375,7 @@ export async function startCheckout(
         productId,
         returnUrl: window.location.origin,
         discountCode: options?.discountCode,
-        referralCode: options?.referralCode,
+        referralCode: effectiveReferral,
       }),
       signal: AbortSignal.timeout(15_000),
     });
