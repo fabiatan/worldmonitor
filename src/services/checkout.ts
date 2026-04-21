@@ -26,6 +26,8 @@ import {
   type CheckoutErrorBody,
 } from './checkout-errors';
 import { showCheckoutErrorToast } from './checkout-error-toast';
+import { showDuplicateSubscriptionDialog } from './checkout-duplicate-dialog';
+import { resolvePlanDisplayName } from './checkout-plan-names';
 
 export {
   saveCheckoutAttempt,
@@ -405,14 +407,23 @@ export async function startCheckout(
       const body = (await resp.json().catch(() => ({}))) as CheckoutErrorBody;
       const error = classifyHttpCheckoutError(resp.status, body);
       reportCheckoutError(error, { productId, action: 'http-error' });
-      // 409 duplicate-subscription continues to route through the
-      // billing portal (PR-7 will add a user-facing dialog before the
-      // portal hand-off). The taxonomy now classifies the code but we
-      // preserve the current navigation until PR-7.
+      // 409 duplicate-subscription — confirm with the user BEFORE
+      // navigating to the billing portal. Previously the portal opened
+      // silently in a new tab, which was disorienting for users who
+      // didn't know they already had a subscription. Dialog content
+      // uses only the whitelisted plan name (NEVER the raw server
+      // `message` or `displayName` string) per PR-3's taxonomy rule.
       if (error.code === 'duplicate_subscription') {
         clearPendingCheckoutIntent();
         clearCheckoutAttempt('duplicate');
-        await openBillingPortal();
+        const planKey = (body as CheckoutErrorBody & { subscription?: { planKey?: unknown } })
+          ?.subscription?.planKey;
+        const planDisplayName = resolvePlanDisplayName(planKey);
+        showDuplicateSubscriptionDialog({
+          planDisplayName,
+          onConfirm: () => { void openBillingPortal(); },
+          onDismiss: () => { /* user stays on the dashboard */ },
+        });
         return false;
       }
       renderCheckoutErrorSurface(error, fallbackToPricingPage);
