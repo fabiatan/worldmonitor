@@ -23,12 +23,14 @@ import {
   CLASSIC_AUTO_DISMISS_MS,
   EXTENDED_UNLOCK_TIMEOUT_MS,
   computeInitialBannerState,
+  maskEmail,
   type CheckoutSuccessBannerState,
 } from './checkout-banner-state';
 
 export {
   EXTENDED_UNLOCK_TIMEOUT_MS,
   computeInitialBannerState,
+  maskEmail,
   type CheckoutSuccessBannerState,
 } from './checkout-banner-state';
 
@@ -440,7 +442,7 @@ export async function startCheckout(
  *               warning. Never silently disappears.
  */
 export function showCheckoutSuccess(
-  options?: { waitForEntitlement?: boolean },
+  options?: { waitForEntitlement?: boolean; email?: string | null },
 ): void {
   const existing = document.getElementById('checkout-success-banner');
   if (existing) existing.remove();
@@ -469,7 +471,12 @@ export function showCheckoutSuccess(
     gap: '12px',
   });
 
-  setBannerText(banner, 'pending');
+  // Resolve the masked email once at mount so subsequent setBannerText
+  // transitions render a consistent string (the Clerk session may
+  // rotate mid-transition in exotic cases but we want the banner to
+  // speak with one voice).
+  const maskedEmail = maskEmail(options?.email);
+  setBannerText(banner, 'pending', maskedEmail);
   document.body.appendChild(banner);
 
   requestAnimationFrame(() => {
@@ -484,7 +491,7 @@ export function showCheckoutSuccess(
 
   const initial = computeInitialBannerState(isEntitled());
   if (initial === 'active') {
-    setBannerText(banner, 'active');
+    setBannerText(banner, 'active', maskedEmail);
     // No auto-dismiss: the entitlement watcher's reload navigates away.
     return;
   }
@@ -494,7 +501,7 @@ export function showCheckoutSuccess(
     if (resolved) return;
     resolved = true;
     unsubscribe();
-    setBannerText(banner, 'timeout');
+    setBannerText(banner, 'timeout', maskedEmail);
     Sentry.captureMessage('Checkout entitlement-activation timeout', {
       level: 'warning',
       tags: { component: 'dodo-checkout', action: 'entitlement-timeout' },
@@ -506,15 +513,21 @@ export function showCheckoutSuccess(
     if (!isEntitled()) return;
     resolved = true;
     clearTimeout(timeoutHandle);
-    setBannerText(banner, 'active');
+    setBannerText(banner, 'active', maskedEmail);
     unsubscribe();
   });
 }
 
-function setBannerText(banner: HTMLElement, state: CheckoutSuccessBannerState): void {
+function setBannerText(
+  banner: HTMLElement,
+  state: CheckoutSuccessBannerState,
+  maskedEmail: string | null,
+): void {
   banner.setAttribute('data-entitlement-state', state);
   if (state === 'pending') {
-    banner.textContent = 'Payment received! Unlocking your premium features…';
+    banner.textContent = maskedEmail
+      ? `Payment received! Receipt sent to ${maskedEmail}. Unlocking your premium features…`
+      : 'Payment received! Unlocking your premium features…';
     return;
   }
   if (state === 'active') {
