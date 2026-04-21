@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { motion } from 'motion/react';
-import { Check, ArrowRight, Zap } from 'lucide-react';
+import { Check, ArrowRight, Zap, Loader2 } from 'lucide-react';
 import { startCheckout } from '../services/checkout';
 
 // Static fallback from build-time generation (used while fetching live prices)
@@ -82,11 +82,23 @@ function getCtaProps(tier: Tier, billing: 'monthly' | 'annual'): CtaProps {
 
 export function PricingSection({ refCode }: { refCode?: string }) {
   const [billing, setBilling] = useState<'monthly' | 'annual'>('monthly');
+  const [loadingProductId, setLoadingProductId] = useState<string | null>(null);
   const TIERS = usePricingData();
 
-  const handleCheckout = useCallback((productId: string) => {
-    startCheckout(productId, { referralCode: refCode });
-  }, [refCode]);
+  // Track loading per-productId (not a single boolean) so the visual
+  // affordance only appears on the specific tier the user clicked —
+  // other tiers stay clickable in case the current attempt fails and
+  // they want to try a different plan. The service-layer
+  // `checkoutInFlight` flag still guards against concurrent calls.
+  const handleCheckout = useCallback(async (productId: string) => {
+    if (loadingProductId !== null) return;
+    setLoadingProductId(productId);
+    try {
+      await startCheckout(productId, { referralCode: refCode });
+    } finally {
+      setLoadingProductId(null);
+    }
+  }, [loadingProductId, refCode]);
 
   return (
     <section id="pricing" className="py-24 px-6 border-t border-wm-border bg-[#060606]">
@@ -220,18 +232,41 @@ export function PricingSection({ refCode }: { refCode?: string }) {
                   >
                     {cta.label} <ArrowRight className="w-3.5 h-3.5 inline-block ml-1" aria-hidden="true" />
                   </a>
-                ) : (
-                  <button
-                    onClick={() => handleCheckout(cta.productId)}
-                    className={`block w-full text-center py-3 rounded-sm font-mono text-xs uppercase tracking-wider font-bold transition-colors cursor-pointer ${
-                      tier.highlighted
-                        ? 'bg-wm-green text-wm-bg hover:bg-green-400'
-                        : 'border border-wm-border text-wm-muted hover:text-wm-text hover:border-wm-text'
-                    }`}
-                  >
-                    {cta.label} <ArrowRight className="w-3.5 h-3.5 inline-block ml-1" aria-hidden="true" />
-                  </button>
-                )}
+                ) : (() => {
+                  const isLoading = loadingProductId === cta.productId;
+                  // Plan AC: "Other tier buttons remain enabled" — the
+                  // user can click a different plan if the current attempt
+                  // stalls or fails. Concurrent-start guard lives in the
+                  // handler (early-return when any checkout is in flight)
+                  // and in the service layer (`checkoutInFlight`), so the
+                  // disabled bit here is a pure visual for the specific
+                  // tier that was just clicked.
+                  return (
+                    <button
+                      onClick={() => handleCheckout(cta.productId)}
+                      disabled={isLoading}
+                      aria-busy={isLoading || undefined}
+                      className={`block w-full text-center py-3 rounded-sm font-mono text-xs uppercase tracking-wider font-bold transition-colors ${
+                        isLoading ? 'cursor-wait opacity-70' : 'cursor-pointer'
+                      } ${
+                        tier.highlighted
+                          ? 'bg-wm-green text-wm-bg hover:bg-green-400'
+                          : 'border border-wm-border text-wm-muted hover:text-wm-text hover:border-wm-text'
+                      }`}
+                    >
+                      {isLoading ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 inline-block mr-2 animate-spin" aria-hidden="true" />
+                          <span>Opening…</span>
+                        </>
+                      ) : (
+                        <>
+                          {cta.label} <ArrowRight className="w-3.5 h-3.5 inline-block ml-1" aria-hidden="true" />
+                        </>
+                      )}
+                    </button>
+                  );
+                })()}
               </motion.div>
             );
           })}
