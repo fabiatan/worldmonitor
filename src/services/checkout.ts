@@ -22,14 +22,12 @@ import { isEntitled, onEntitlementChange } from './entitlements';
 import {
   CLASSIC_AUTO_DISMISS_MS,
   EXTENDED_UNLOCK_TIMEOUT_MS,
-  computeInitialBannerState,
   maskEmail,
   type CheckoutSuccessBannerState,
 } from './checkout-banner-state';
 
 export {
   EXTENDED_UNLOCK_TIMEOUT_MS,
-  computeInitialBannerState,
   maskEmail,
   type CheckoutSuccessBannerState,
 } from './checkout-banner-state';
@@ -38,7 +36,6 @@ export {
   saveCheckoutAttempt,
   loadCheckoutAttempt,
   clearCheckoutAttempt,
-  sweepAbandonedCheckoutAttempt,
   type CheckoutAttempt,
   type CheckoutAttemptClearReason,
 } from './checkout-attempt';
@@ -88,7 +85,7 @@ interface PendingCheckoutIntent {
 
 let initialized = false;
 let onSuccessCallback: (() => void) | null = null;
-let _successFired = false;
+let _resetOverlaySession: (() => void) | null = null;
 let _watchersInitialized = false;
 
 /**
@@ -104,6 +101,19 @@ export function initCheckoutOverlay(onSuccess?: () => void): void {
 
   const env = import.meta.env.VITE_DODO_ENVIRONMENT;
 
+  // `successFired` must be scoped per-overlay-session, NOT module.
+  // Previously this was `let _successFired = false;` at module scope,
+  // which leaked state across sessions: if a user's success path ran
+  // and then a later `openCheckout` call re-entered the overlay, the
+  // stale `true` made the close handler skip the pending-intent clear,
+  // leaving PENDING_CHECKOUT_KEY populated for a silent auto-retry.
+  // DodoPayments.Initialize is idempotent (guarded by `initialized`),
+  // so there's only ever one onEvent closure — but ONE session's state
+  // must reset when a new overlay opens. `openCheckout` resets this
+  // flag via the exported `resetOverlaySessionState()` helper below.
+  let successFired = false;
+  _resetOverlaySession = () => { successFired = false; };
+
   DodoPayments.Initialize({
     mode: env === 'live_mode' ? 'live' : 'test',
     displayType: 'overlay',
@@ -111,7 +121,7 @@ export function initCheckoutOverlay(onSuccess?: () => void): void {
       switch (event.event_type) {
         case 'checkout.status':
           if (event.data?.status === 'succeeded') {
-            _successFired = true;
+            successFired = true;
             onSuccessCallback?.();
             // Terminal success: clear both keys. LAST_CHECKOUT_ATTEMPT_KEY
             // is no longer needed (no retry context required); PENDING is
@@ -123,14 +133,20 @@ export function initCheckoutOverlay(onSuccess?: () => void): void {
             // detector would treat the first pro snapshot as "legacy-pro
             // baseline" and swallow the activation.
             //
-            // Reload ownership: as of PR-4, the entitlement watcher in
-            // panel-layout.ts is the SINGLE reload source (fires on
-            // free→pro transition). We no longer schedule a 3s setTimeout
-            // reload here — that competed with the entitlement watcher's
-            // reload and made "still unlocking" UX impossible because the
-            // banner was guaranteed to be wiped at 3s regardless of
-            // webhook latency. The watcher's reload depends on the
-            // 2026-04-18-001 fix landing first (#3163, merged).
+            // Reload ownership: the entitlement watcher in panel-layout.ts
+            // is the SINGLE reload source (fires on free→pro transition).
+            // We no longer schedule a belt-and-braces setTimeout reload
+            // here — that competed with the watcher and made "still
+            // unlocking" UX impossible because the banner was guaranteed
+            // to be wiped at 3s regardless of webhook latency.
+            //
+            // REQUIRES_SKIP_INITIAL_SNAPSHOT_BEHAVIOR — the watcher's
+            // first-snapshot seeding depends on PR #3163 (merged
+            // 2026-04-18) having fixed the swallow-first-snapshot bug.
+            // If that PR is ever reverted or its behavior regresses,
+            // tests in tests/entitlement-transition.test.mts will fail
+            // (specifically "simulates the incident sequence" case); see
+            // the mirror marker in panel-layout.ts.
             markPostCheckout();
           }
           break;
@@ -142,7 +158,7 @@ export function initCheckoutOverlay(onSuccess?: () => void): void {
           // the retry CTA. The attempt record will be cleared later by
           // the terminal path that actually resolves (success, dismissed,
           // duplicate, or the mount-time abandonment sweep).
-          if (!_successFired) {
+          if (!successFired) {
             clearPendingCheckoutIntent();
           }
           break;
@@ -252,7 +268,6 @@ export function capturePendingCheckoutIntentFromUrl(): PendingCheckoutIntent | n
     referralCode: intent.referralCode,
     discountCode: intent.discountCode,
     startedAt: Date.now(),
-    origin: 'pro',
   });
 
   url.searchParams.delete(CHECKOUT_PRODUCT_PARAM);
@@ -301,6 +316,11 @@ export async function resumePendingCheckout(options?: {
  */
 export function openCheckout(checkoutUrl: string): void {
   initCheckoutOverlay();
+  // Reset the per-session successFired flag so a prior session's
+  // terminal state can't leak into this one. (The flag lives in a
+  // closure inside initCheckoutOverlay's event handler; this resets
+  // it.)
+  _resetOverlaySession?.();
 
   DodoPayments.Checkout.open({
     checkoutUrl,
@@ -357,7 +377,7 @@ export async function startCheckout(
   }
 
   _checkoutInFlight = true;
-  _successFired = false;
+  _resetOverlaySession?.();
   // Record the attempt BEFORE the network call so the failure-retry
   // banner has context even if every subsequent step fails (timeout,
   // user closes tab before Dodo redirects, SDK crashes, etc.).
@@ -366,7 +386,6 @@ export async function startCheckout(
     referralCode: options?.referralCode,
     discountCode: options?.discountCode,
     startedAt: Date.now(),
-    origin: 'dashboard',
   });
   try {
     let token = await getClerkToken();
@@ -441,9 +460,22 @@ export async function startCheckout(
  *               "Refresh if features haven't unlocked" CTA + Sentry
  *               warning. Never silently disappears.
  */
+// Module-scoped cleanup for the currently-mounted success banner.
+// When `showCheckoutSuccess` is called a second time before the first
+// resolves (e.g., Dodo has historically double-fired checkout.status
+// — see docs/plans/2026-04-18-001-fix-pro-activation-race-*), this
+// tears down the prior banner's entitlement subscription + timeout
+// before mounting the new one. Without this, the prior `onEntitlementChange`
+// listener stays in the Set with a closure over a detached DOM node,
+// firing on every future entitlement update for the page lifetime.
+let _currentBannerCleanup: (() => void) | null = null;
+
 export function showCheckoutSuccess(
   options?: { waitForEntitlement?: boolean; email?: string | null },
 ): void {
+  _currentBannerCleanup?.();
+  _currentBannerCleanup = null;
+
   const existing = document.getElementById('checkout-success-banner');
   if (existing) existing.remove();
 
@@ -489,8 +521,11 @@ export function showCheckoutSuccess(
     return;
   }
 
-  const initial = computeInitialBannerState(isEntitled());
-  if (initial === 'active') {
+  // If the user is already entitled when the banner fires (e.g., the
+  // post-reload consumePostCheckoutFlag path where the entitlement
+  // watcher already flipped true), skip straight to "active" so the
+  // banner doesn't falsely suggest the webhook is still in flight.
+  if (isEntitled()) {
     setBannerText(banner, 'active', maskedEmail);
     // No auto-dismiss: the entitlement watcher's reload navigates away.
     return;
@@ -501,6 +536,7 @@ export function showCheckoutSuccess(
     if (resolved) return;
     resolved = true;
     unsubscribe();
+    _currentBannerCleanup = null;
     setBannerText(banner, 'timeout', maskedEmail);
     Sentry.captureMessage('Checkout entitlement-activation timeout', {
       level: 'warning',
@@ -513,9 +549,20 @@ export function showCheckoutSuccess(
     if (!isEntitled()) return;
     resolved = true;
     clearTimeout(timeoutHandle);
+    _currentBannerCleanup = null;
     setBannerText(banner, 'active', maskedEmail);
     unsubscribe();
   });
+
+  // Register cleanup so a re-entrant showCheckoutSuccess call (e.g. a
+  // double-fire of `checkout.status=succeeded`) tears down this
+  // banner's listener + timer before mounting a replacement.
+  _currentBannerCleanup = () => {
+    if (resolved) return;
+    resolved = true;
+    clearTimeout(timeoutHandle);
+    unsubscribe();
+  };
 }
 
 function setBannerText(
